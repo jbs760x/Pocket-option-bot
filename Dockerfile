@@ -1,16 +1,18 @@
-# Playwright image includes Chromium & all deps we need for real trades
+# Use Playwright base image (includes Chromium)
 FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
+# Prevents .pyc files + forces log flushing
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# bring in our code
+# Bring in code
 COPY . .
 
-# start long-polling bot (no web server, no webhook headaches)
-CMD ["python","-u","bot.py"]
+# Start bot (long-polling)
+CMD ["python", "-u", "bot.py"]
