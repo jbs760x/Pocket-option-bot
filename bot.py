@@ -204,6 +204,8 @@ tg.add_handler(CommandHandler("watch", cmd_watch))
 tg.add_handler(CommandHandler("interval", cmd_interval))
 tg.add_handler(CommandHandler("go", cmd_go))
 tg.add_handler(CommandHandler("stop", cmd_stop))
+tg.add_handler(CommandHandler("last", cmd_last))
+tg.add_handler(CommandHandler("latency", cmd_latency))
 
 @app.on_event("startup")
 async def on_startup():
