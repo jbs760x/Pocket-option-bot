@@ -1,70 +1,104 @@
 import os
 import requests
 from fastapi import FastAPI, Request
-from telegram import Update, Bot
-from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
+from typing import Optional
 
-TOKEN = os.getenv("BOT_TOKEN", "8471181182:AAEKGH1UASa5XvkXscb3jb5d1Yz19B8oJNM")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8471181182:AAEKGH1UASa5XvkXscb3jb5d1Yz19B8oJNM")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "9aa4ea677d00474aa0c3223d0c812425")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # set this later to your numeric chat id
 
-bot = Bot(token=TOKEN)
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TD_URL  = "https://api.twelvedata.com/time_series"
+
 app = FastAPI()
-dispatcher = Dispatcher(bot, None, workers=0)
 
-# ---------- COMMANDS ----------
-def start(update, context):
-    update.message.reply_text(
-        "🤖 Bot is live!\n\n"
-        "Commands:\n"
-        "/last EUR/USD → get last candle\n"
-        "/latency EUR/USD → check data freshness\n"
-    )
+def log(*args):
+    print("[BOT]", *args, flush=True)
 
-def last(update, context):
-    if len(context.args) == 0:
-        update.message.reply_text("⚠️ Usage: /last EUR/USD")
-        return
-    symbol = context.args[0].replace("/", "")
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1min&apikey={TWELVE_API_KEY}&outputsize=1"
-    r = requests.get(url).json()
-    if "values" in r:
-        v = r["values"][0]
-        update.message.reply_text(
-            f"📊 {context.args[0]} (1min)\n"
-            f"Time: {v['datetime']}\n"
-            f"Open: {v['open']} High: {v['high']} Low: {v['low']} Close: {v['close']}"
-        )
-    else:
-        update.message.reply_text("❌ Error fetching data.")
+def tg_send(chat_id: int, text: str, parse_mode: Optional[str] = None):
+    try:
+        data = {"chat_id": chat_id, "text": text}
+        if parse_mode: data["parse_mode"] = parse_mode
+        r = requests.post(f"{TG_API}/sendMessage", json=data, timeout=15)
+        log("sendMessage status", r.status_code, r.text[:200])
+        return r.ok
+    except Exception as e:
+        log("sendMessage ERROR", e)
+        return False
 
-def latency(update, context):
-    if len(context.args) == 0:
-        update.message.reply_text("⚠️ Usage: /latency EUR/USD")
-        return
-    symbol = context.args[0].replace("/", "")
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1min&apikey={TWELVE_API_KEY}&outputsize=1"
-    r = requests.get(url).json()
-    if "values" in r:
-        v = r["values"][0]
-        update.message.reply_text(
-            f"🕒 Last bar time: {v['datetime']} (server time UTC)"
-        )
-    else:
-        update.message.reply_text("❌ Error fetching latency.")
+def td_last(symbol: str, interval: str = "1min"):
+    s = symbol.replace("/", "")
+    params = {"symbol": s, "interval": interval, "apikey": TWELVE_API_KEY, "outputsize": 1, "order": "ASC"}
+    r = requests.get(TD_URL, params=params, timeout=30).json()
+    if "values" not in r or not r["values"]: return None
+    v = r["values"][-1]
+    return {"dt": v.get("datetime"), "open": v.get("open"), "high": v.get("high"),
+            "low": v.get("low"), "close": v.get("close"), "symbol": symbol}
 
-# ---------- DISPATCH ----------
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("last", last))
-dispatcher.add_handler(CommandHandler("latency", latency))
-
-# ---------- FASTAPI ----------
-@app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, bot)
-    dispatcher.process_update(update)
-    return {"ok": True}
+@app.get("/")
+def home(): return {"ok": True}
 
 @app.get("/health")
-async def health():
+def health(): return {"ok": True}
+
+# Send yourself a message even if webhook is broken
+@app.get("/__test")
+def test(msg: str = "hello from server"):
+    if not ADMIN_CHAT_ID:
+        return {"ok": False, "error": "Set ADMIN_CHAT_ID in Railway Variables (numeric chat id)."}
+    ok = tg_send(int(ADMIN_CHAT_ID), f"✅ TEST: {msg}")
+    return {"ok": ok}
+
+@app.post("/webhook")
+async def webhook(req: Request):
+    upd = await req.json()
+    log("WEBHOOK UPDATE:", upd)
+
+    msg = upd.get("message") or upd.get("edited_message")
+    if not msg:
+        return {"ok": True}
+
+    chat_id = msg["chat"]["id"]
+    text = (msg.get("text") or "").strip()
+
+    if text.lower().startswith("/start"):
+        tg_send(chat_id,
+            "🤖 Bot is live!\n\n"
+            "Commands:\n"
+            "• /last EUR/USD  → latest candle\n"
+            "• /latency EUR/USD → last candle timestamp"
+        )
+        return {"ok": True}
+
+    if text.lower().startswith("/last"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            tg_send(chat_id, "Usage: /last EUR/USD")
+            return {"ok": True}
+        sym = parts[1].upper()
+        data = td_last(sym)
+        if not data:
+            tg_send(chat_id, f"❌ Could not fetch {sym}.")
+            return {"ok": True}
+        tg_send(chat_id,
+            f"📊 {data['symbol']} 1m\n"
+            f"Time(UTC): {data['dt']}\n"
+            f"O:{data['open']} H:{data['high']} L:{data['low']} C:{data['close']}"
+        )
+        return {"ok": True}
+
+    if text.lower().startswith("/latency"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            tg_send(chat_id, "Usage: /latency EUR/USD")
+            return {"ok": True}
+        sym = parts[1].upper()
+        data = td_last(sym)
+        if not data:
+            tg_send(chat_id, f"❌ Could not fetch {sym}.")
+            return {"ok": True}
+        tg_send(chat_id, f"🕒 Last bar for {sym} (1m): {data['dt']} UTC")
+        return {"ok": True}
+
+    # ignore others
     return {"ok": True}
