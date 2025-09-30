@@ -8,16 +8,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 app = FastAPI()
-tg_app = None  # will be created in startup
+tg_app = None
 
-# --- Telegram handlers ---
 async def start_cmd(update: Update, ctx):
     await update.message.reply_text("📈 Pocket Option Bot is online 24/7 ✅")
 
 async def stats_cmd(update: Update, ctx):
     await update.message.reply_text("📊 Stats coming soon…")
 
-# --- Lifespan (startup/shutdown) ---
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global tg_app
@@ -43,7 +41,6 @@ async def lifespan(_: FastAPI):
 
 app.router.lifespan_context = lifespan
 
-# --- Routes ---
 @app.get("/health")
 async def health():
     return {
