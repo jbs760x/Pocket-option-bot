@@ -1,13 +1,8 @@
-# Minimal Telegram bot using only httpx long-polling (no webhooks, no Docker)
 import os, asyncio
 import httpx
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN env var missing in Railway > Variables")
-
-API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-offset = 0  # tells Telegram we've processed up to this update_id
+API = None
+offset = 0
 
 async def tg_get(path, **params):
     async with httpx.AsyncClient(timeout=30) as c:
@@ -23,7 +18,7 @@ async def tg_post(path, **params):
 
 async def handle_update(upd):
     msg = upd.get("message")
-    if not msg or "text" not in msg:
+    if not msg or "text" not in msg: 
         return
     chat_id = msg["chat"]["id"]
     text = (msg["text"] or "").strip()
@@ -32,16 +27,25 @@ async def handle_update(upd):
         await tg_post("sendMessage", chat_id=chat_id,
                       text="✅ Bot online (polling). Commands: /start, /stats, /help")
     elif text == "/stats":
-        await tg_post("sendMessage", chat_id=chat_id,
-                      text="📊 Stats coming soon")
+        await tg_post("sendMessage", chat_id=chat_id, text="📊 Stats coming soon")
     elif text == "/help":
         await tg_post("sendMessage", chat_id=chat_id,
-                      text="Commands:\n/start – check bot\n/stats – show counters\n/help – this message")
+                      text="Commands:\n/start\n/stats\n/help")
     else:
-        await tg_post("sendMessage", chat_id=chat_id,
-                      text=f"You said: {text}")
+        await tg_post("sendMessage", chat_id=chat_id, text=f"You said: {text}")
 
-async def main():
+async def wait_for_token():
+    global API
+    while True:
+        tok = os.getenv("BOT_TOKEN")
+        if tok and ":" in tok:
+            API = f"https://api.telegram.org/bot{tok}"
+            print("BOT_TOKEN detected, starting polling…")
+            return
+        print("BOT_TOKEN missing/invalid. Set it in Railway → Variables. Retrying in 10s…")
+        await asyncio.sleep(10)
+
+async def poll_loop():
     global offset
     while True:
         try:
@@ -51,7 +55,11 @@ async def main():
                 await handle_update(upd)
         except Exception as e:
             print("poll error:", e)
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
+
+async def main():
+    await wait_for_token()
+    await poll_loop()
 
 if __name__ == "__main__":
     asyncio.run(main())
