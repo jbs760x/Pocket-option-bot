@@ -1,3 +1,5 @@
-python-telegram-bot>=20.3,<21.0
-requests
-schedule
+python-telegram-bot==20.3
+fastapi
+uvicorn
+httpx
+pydantic
