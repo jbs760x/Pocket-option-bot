@@ -1,53 +1,36 @@
-# Telegram bot on Railway using FastAPI webhook (no polling needed).
-# Plug-and-play: requires two env vars in Railway:
-# - BOT_TOKEN: your BotFather token (looks like 123456:ABC...).
-# - WEBHOOK_SECRET: any string you choose (must match when setting the webhook).
-
-import os
-from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi import FastAPI, Request
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")                      # <== must be set in Railway → Variables
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change")  # <== set this too
+# Your real token hardcoded
+TOKEN = "847181182:AAHmg0kbRTuhDUtp15Vj6rhp8f-bZcLzj8"
+SECRET = "Desert760_123"  # Secret you chose
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing in Railway Variables")
-
-# Build Telegram app (do NOT run_polling here)
-tg = Application.builder().token(BOT_TOKEN).build()
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot is online on Railway (webhook mode).")
-
-tg.add_handler(CommandHandler("start", cmd_start))
-
-# FastAPI app
 app = FastAPI()
+tg_app = Application.builder().token(TOKEN).build()
+
+# /start command
+async def start(update: Update, context):
+    await update.message.reply_text("✅ Bot is alive and working!")
+
+tg_app.add_handler(CommandHandler("start", start))
 
 @app.on_event("startup")
-async def startup():
-    await tg.initialize()
-    print("🚀 FastAPI started; Telegram initialized.")
+async def on_startup():
+    await tg_app.initialize()
 
 @app.on_event("shutdown")
-async def shutdown():
-    await tg.shutdown()
-    print("👋 Shutdown complete.")
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
+async def on_shutdown():
+    await tg_app.shutdown()
 
 @app.post("/webhook")
-async def telegram_webhook(
-    request: Request,
-    x_telegram_bot_api_secret_token: str | None = Header(default=None),
-):
-    # Optional security: require Telegram’s secret header to match our WEBHOOK_SECRET
-    if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Bad secret")
-    data = await request.json()
-    update = Update.de_json(data, tg.bot)
-    await tg.process_update(update)
+async def webhook(req: Request):
+    if req.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET:
+        return {"ok": False}
+    data = await req.json()
+    await tg_app.update_queue.put(Update.de_json(data, tg_app.bot))
+    return {"ok": True}
+
+@app.get("/health")
+def health():
     return {"ok": True}
