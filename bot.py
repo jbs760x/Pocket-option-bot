@@ -227,3 +227,27 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(No
 @app.get("/")
 def home():
     return {"status": "ok"}
+    async def fetch_latest_bar(session: aiohttp.ClientSession, symbol: str, interval: str):
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "apikey": TWELVE_API_KEY,
+        "outputsize": 1,
+        "format": "JSON",
+        "order": "ASC",
+    }
+    async with session.get(API_URL, params=params, timeout=30) as resp:
+        js = await resp.json(content_type=None)
+        if "values" not in js or not js["values"]:
+            return None
+        v = js["values"][-1]
+        # v["datetime"] example: "2025-09-30 17:24:00"
+        return {
+            "datetime": v.get("datetime"),
+            "open": float(v["open"]),
+            "high": float(v["high"]),
+            "low": float(v["low"]),
+            "close": float(v["close"]),
+            "symbol": symbol,
+            "interval": interval,
+        
