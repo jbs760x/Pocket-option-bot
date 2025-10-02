@@ -1,383 +1,458 @@
-import os, time, threading, requests, signal
-from datetime import datetime, timedelta, timezone, date
-from telegram import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
+import os
+import time
+import json
+import threading
+import traceback
+import requests
+from datetime import datetime, timedelta
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
 
-# ===== ENV (set these in Render → Environment) =====
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TWELVE_API_KEY     = os.environ.get("TWELVE_API_KEY", "")
-PUBLIC_URL         = os.environ.get("PUBLIC_URL", "")
-PORT               = int(os.environ.get("PORT", "10000"))
+# ========= HARD-CODED KEYS (per your request) =========
+TELEGRAM_BOT_TOKEN = "8471181182:AAEKGH1UASa5XvkXscb3jb5d1Yz19B8oJNM"
+TWELVE_API_KEY     = "9aa4ea677d00474aa0c3223d0c812425"
+ALPHA_VANTAGE_KEY  = "BM22MZEIOLL68RI6"
 
-if not TELEGRAM_BOT_TOKEN or not TWELVE_API_KEY or not PUBLIC_URL:
-    raise RuntimeError("Set TELEGRAM_BOT_TOKEN, TWELVE_API_KEY, PUBLIC_URL in Render env.")
+# Your Render URL (no trailing slash)
+PUBLIC_URL = "https://moneymakerjbsbot.onrender.com"
+PORT = int(os.environ.get("PORT", "10000"))
 
-# ===== State tuned for OTC & API-thrift =====
+# ========= POCKET OPTION WEBSOCKET (GUEST MODE) =========
+# If this ever changes, set PO_WS_URL in Render Environment to override.
+PO_WS_URL = os.environ.get("PO_WS_URL", "wss://ws.pocketoption.net/")
+
+# ========= BOT STATE (LEAN + STRICT OTC) =========
 STATE = {
-    "watchlist": ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC", "USDCHF-OTC"],  # exactly 5 by default
-    "autopoll_running": False, "autopoll_thread": None,
-    "tf": "5min", "duration_min": 60,
-    "amount": 5.0,
+    # Watch exactly 5 OTC pairs (edit if you need different ones)
+    "watchlist": ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC", "USDCHF-OTC"],
 
-    # Accuracy first (strict)
-    "threshold": 0.78,          # need >= 78% confidence
-    "require_votes": 4,         # 4/4 confluence for OTC
-    "atr_floor": 0.0005,        # skip dead/chop
+    "autopoll_running": False,
+    "autopoll_thread": None,
 
-    # Cadence & API thrift
-    "candle_close_only": True,  # only at M5 close
-    "cooldown_min": 5,          # per-pair cooldown
-    "min_signal_gap_min": 7,    # global min gap
-    "max_calls_per_hour": 60,   # 5 pairs × 12 scans/hr
-    "daily_call_cap": 800,
+    # Session & cadence
+    "duration_min": 60,           # how long /autopoll runs
+    "cooldown_min": 5,            # per-pair cooldown (minutes)
+    "min_signal_gap_min": 7,      # global min gap between any two signals (minutes)
 
-    # Guardrails & stats
-    "loss_streak_stop": 3,
-    "stats": {"wins":0,"losses":0,"skips":0,"consec_losses":0,"consec_wins":0,"last_reset_date":None},
+    # Accuracy filters (strict)
+    "threshold": 0.80,            # confidence threshold (80%)
+    "require_votes": 4,           # must hit all 4: Trend, RSI50, MACD>Sig, EMA20>EMA50
+    "atr_floor": 0.0006,          # skip flat/choppy markets
 
-    # internals
+    # Risk guardrail
+    "loss_streak_limit": 3,
+    "loss_streak": 0,
+
+    # Payout filtering (guest WS)
+    "min_payout": 80,             # require payout ≥ this %
+    "require_payout_known": True, # if True, skip if payout unknown from WS
+    "payouts": {},                # filled by WS listener, e.g. {"EURUSD-OTC": 82}
+
+    # Internals
     "last_signal_time": None,
-    "pair_last_signal_time": {},
-    "last_chat_id": None,
-    "last_signal_message_ids": {},
+    "pair_last_signal_time": {}
 }
 
-CALL_METER = {"hour_bucket": None, "hour_calls": 0, "day_bucket": None, "day_calls": 0}
-STOP_EVENT = threading.Event()
-
-# ---------- helpers ----------
-def now_utc(): return datetime.now(timezone.utc)
-
-def reset_counters_if_needed():
-    hb = now_utc().replace(minute=0, second=0, microsecond=0)
-    if CALL_METER["hour_bucket"] != hb:
-        CALL_METER["hour_bucket"] = hb; CALL_METER["hour_calls"] = 0
-    db = now_utc().date()
-    if CALL_METER["day_bucket"] != db:
-        CALL_METER["day_bucket"] = db; CALL_METER["day_calls"] = 0
-
-def budget_ok():
-    reset_counters_if_needed()
-    return CALL_METER["hour_calls"] < STATE["max_calls_per_hour"] and CALL_METER["day_calls"] < STATE["daily_call_cap"]
-
-def count_call():
-    CALL_METER["hour_calls"] += 1; CALL_METER["day_calls"] += 1
-
-def wait_until_next_m5_close():
-    now = now_utc()
-    secs = (5 - (now.minute % 5)) * 60 - now.second
-    if secs <= 0: secs += 300
-    time.sleep(secs + 2)  # +2s to ensure close
-
-# ---------- data fetch ----------
-def fetch_ohlcv_twelve(pair, interval="5min", limit=120):
+# ========= DATA FETCHERS (Twelve primary, AV fallback for non-OTC) =========
+def fetch_twelve(symbol, tf="5min"):
     url = "https://api.twelvedata.com/time_series"
-    params = {"symbol": pair, "interval": interval, "outputsize": limit, "apikey": TWELVE_API_KEY, "order":"ASC", "timezone":"UTC"}
+    params = {
+        "symbol": symbol, "interval": tf, "outputsize": 60,
+        "apikey": TWELVE_API_KEY, "order": "ASC", "timezone": "UTC"
+    }
     try:
-        if not budget_ok(): return None
         r = requests.get(url, params=params, timeout=12)
-        count_call()
         r.raise_for_status()
         j = r.json()
-        if "values" not in j: return None
+        if "values" not in j:
+            return None
         out = []
         for v in j["values"]:
             out.append({
-                "time": datetime.fromisoformat(v["datetime"]).replace(tzinfo=timezone.utc),
-                "open": float(v["open"]), "high": float(v["high"]),
-                "low": float(v["low"]), "close": float(v["close"])
+                "t": datetime.fromisoformat(v["datetime"]),
+                "o": float(v["open"]), "h": float(v["high"]),
+                "l": float(v["low"]),  "c": float(v["close"])
             })
-        out.sort(key=lambda b: b["time"])
-        return out[-limit:]
+        out.sort(key=lambda x: x["t"])
+        return out[-60:]
     except Exception:
         return None
 
-def fetch_ohlcv(pair, interval="5min", limit=120):
-    return fetch_ohlcv_twelve(pair, interval, limit)  # OTC primary; no fallback to avoid waste
+def fetch_av(symbol, tf="5min"):
+    # Alpha Vantage doesn't support OTC; fallback only for non-OTC pairs
+    if "-OTC" in symbol:
+        return None
+    try:
+        base, quote = symbol[:3], symbol[3:]
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "FX_INTRADAY", "from_symbol": base, "to_symbol": quote,
+            "interval": tf, "apikey": ALPHA_VANTAGE_KEY, "outputsize": "compact"
+        }
+        j = requests.get(url, params=params, timeout=12).json()
+        key = "Time Series FX (5min)"
+        if key not in j:
+            return None
+        items = []
+        for ts, v in j[key].items():
+            items.append({
+                "t": datetime.fromisoformat(ts),
+                "o": float(v["1. open"]), "h": float(v["2. high"]),
+                "l": float(v["3. low"]),  "c": float(v["4. close"])
+            })
+        items.sort(key=lambda x: x["t"])
+        return items[-60:]
+    except Exception:
+        return None
 
-# ---------- indicators ----------
-def ema(values, period):
-    if len(values) < period: return []
-    k = 2/(period+1); out = [None]*(period-1); sma = sum(values[:period])/period; out.append(sma)
-    for i in range(period, len(values)): out.append(out[-1] + k*(values[i]-out[-1]))
-    return out
+def fetch_ohlcv(symbol, tf="5min"):
+    bars = fetch_twelve(symbol, tf)
+    if bars:
+        return bars
+    return fetch_av(symbol, tf)
 
-def rsi(values, period=14):
-    if len(values) < period+1: return []
+# ========= INDICATORS (lean but solid) =========
+def ema_last(vals, period):
+    if len(vals) < period:
+        return None
+    k = 2/(period+1)
+    e = sum(vals[:period]) / period
+    for v in vals[period:]:
+        e = e + k*(v - e)
+    return e
+
+def rsi_last(vals, period=14):
+    if len(vals) < period + 1:
+        return None
     gains, losses = [], []
-    for i in range(1, len(values)):
-        ch = values[i]-values[i-1]; gains.append(max(ch,0)); losses.append(max(-ch,0))
-    avg_gain = sum(gains[:period])/period; avg_loss = sum(losses[:period])/period
-    rsis = [None]*period
+    for i in range(1, len(vals)):
+        ch = vals[i] - vals[i-1]
+        gains.append(max(ch, 0))
+        losses.append(max(-ch, 0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
     for i in range(period, len(gains)):
-        avg_gain = (avg_gain*(period-1)+gains[i])/period
-        avg_loss = (avg_loss*(period-1)+losses[i])/period
-        rs = (avg_gain/avg_loss) if avg_loss!=0 else 999
-        rsis.append(100 - 100/(1+rs))
-    return rsis
+        avg_gain = (avg_gain*(period-1) + gains[i]) / period
+        avg_loss = (avg_loss*(period-1) + losses[i]) / period
+    rs = (avg_gain / avg_loss) if avg_loss != 0 else 999
+    return 100 - 100/(1+rs)
 
-def macd(values, fast=12, slow=26, signal=9):
-    ef, es = ema(values, fast), ema(values, slow)
-    line = [None if (i>=len(ef) or i>=len(es) or ef[i] is None or es[i] is None) else ef[i]-es[i] for i in range(len(values))]
-    valid = [v for v in line if v is not None]
-    if len(valid) < signal: return line, []
-    sig = ema(valid, signal); sig = [None]*(len(line)-len(sig)) + sig
-    return line, sig
+def macd_last(vals, fast=12, slow=26, signal=9):
+    if len(vals) < slow + signal:
+        return None, None
+    # compute EMA series cheaply
+    def ema_series(arr, n):
+        if len(arr) < n: return []
+        k = 2/(n+1)
+        e = sum(arr[:n]) / n
+        out = [None]*(n-1) + [e]
+        for v in arr[n:]:
+            e = e + k*(v - e)
+            out.append(e)
+        return out
+    ef = ema_series(vals, fast)
+    es = ema_series(vals, slow)
+    macd_line = [ (ef[i] - es[i]) if ef[i] and es[i] else None for i in range(len(vals)) ]
+    macd_vals = [x for x in macd_line if x is not None]
+    if len(macd_vals) < signal:
+        return None, None
+    sig_series = ema_series(macd_vals, signal)
+    return macd_line[-1], sig_series[-1]
 
-def atr(highs, lows, closes, period=14):
-    if len(closes) < period+1: return []
+def atr_last(highs, lows, closes, period=14):
+    if len(closes) < period + 1:
+        return None
     trs = []
     for i in range(1, len(closes)):
         trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
-    out = [None]*(period-1); out.append(sum(trs[:period])/period)
-    for i in range(period, len(trs)): out.append((out[-1]*(period-1)+trs[i])/period)
-    return out
+    atr = sum(trs[:period]) / period
+    for i in range(period, len(trs)):
+        atr = (atr*(period-1) + trs[i]) / period
+    return atr
 
-def aggregate_m15_from_m5(bars):
-    if not bars: return []
-    out = []; agg = None; curr = None
-    for b in bars:
-        bs = b["time"].replace(minute=(b["time"].minute//15)*15, second=0, microsecond=0)
-        if curr is None or bs != curr:
-            if agg: out.append(agg)
-            curr = bs; agg = {"time": bs, "open": b["open"], "high": b["high"], "low": b["low"], "close": b["close"]}
-        else:
-            agg["high"] = max(agg["high"], b["high"]); agg["low"] = min(agg["low"], b["low"]); agg["close"] = b["close"]
-    if agg: out.append(agg)
-    return out[-120:]
+# ========= STRATEGY (strict OTC confluence) =========
+def analyze(symbol):
+    bars = fetch_ohlcv(symbol, "5min")
+    if not bars or len(bars) < 60:
+        return (False, None, 0.0, "No/low data")
 
-# ---------- evaluator (OTC strict) ----------
-def evaluate_pair_otc(pair, bars):
-    closes = [b["close"] for b in bars]
-    highs  = [b["high"]  for b in bars]
-    lows   = [b["low"]   for b in bars]
-    if len(closes) < 220: return (False, None, 0.0, "Not enough history")
+    closes = [b["c"] for b in bars]
+    highs  = [b["h"] for b in bars]
+    lows   = [b["l"] for b in bars]
 
-    ema200_m5 = ema(closes, 200); ema50_m5 = ema(closes, 50); ema20_m5 = ema(closes, 20)
-    rsi14 = rsi(closes, 14); macd_line, macd_sig = macd(closes); atr14 = atr(highs, lows, closes, 14)
-    if not atr14 or atr14[-1] is None or atr14[-1] < STATE["atr_floor"]: return (False, None, 0.0, f"ATR too low")
+    ema20  = ema_last(closes, 20)
+    ema50  = ema_last(closes, 50)
+    ema200 = ema_last(closes, 200) if len(closes) >= 200 else sum(closes)/len(closes)
+    rsi14  = rsi_last(closes, 14)
+    macd_line, macd_sig = macd_last(closes)
+    atr14  = atr_last(highs, lows, closes, 14)
 
-    m15 = aggregate_m15_from_m5(bars); m15_closes = [b["close"] for b in m15]; ema200_m15 = ema(m15_closes, 200)
-    if not ema200_m15 or ema200_m15[-1] is None: return (False, None, 0.0, "No M15 trend")
+    if atr14 is None or atr14 < STATE["atr_floor"]:
+        return (False, None, 0.0, "Low ATR")
 
-    if STATE["candle_close_only"]:
-        last_bar = bars[-1]["time"]
-        if (now_utc() - last_bar).total_seconds() < 5: return (False, None, 0.0, "Waiting M5 close")
+    up = dn = 0
+    if closes[-1] > ema200: up += 1
+    else: dn += 1
+    if rsi14 is not None and rsi14 > 50: up += 1
+    elif rsi14 is not None: dn += 1
+    if macd_line is not None and macd_sig is not None:
+        if macd_line > macd_sig: up += 1
+        else: dn += 1
+    if ema20 is not None and ema50 is not None:
+        if ema20 > ema50: up += 1
+        else: dn += 1
 
-    bias_up = closes[-1] > ema200_m15[-1]; bias_dn = closes[-1] < ema200_m15[-1]
-    up, dn = 0, 0
-    if bias_up: up += 1
-    if bias_dn: dn += 1
-    if rsi14[-2] is not None and rsi14[-1] is not None:
-        if rsi14[-2] <= 50 < rsi14[-1]: up += 1
-        if rsi14[-2] >= 50 > rsi14[-1]: dn += 1
-    if macd_line[-1] is not None and macd_sig[-1] is not None:
-        if macd_line[-1] > macd_sig[-1]: up += 1
-        if macd_line[-1] < macd_sig[-1]: dn += 1
-    if ema20_m5[-1] and ema50_m5[-1]:
-        if bias_up and closes[-1] > ema20_m5[-1] and closes[-1] > ema50_m5[-1]: up += 1
-        if bias_dn and closes[-1] < ema20_m5[-1] and closes[-1] < ema50_m5[-1]: dn += 1
-
-    need = STATE["require_votes"]; side = None; votes = 0
-    if up >= need and up > dn:   side, votes = "BUY",  up
-    elif dn >= need and dn > up: side, votes = "SELL", dn
-    else: return (False, None, 0.0, f"No side: up={up} dn={dn}")
-
-    conf = max(0.0, min(0.95, 0.65 + 0.05*(votes-3)))  # 3->0.70, 4->0.75
-    return (True, side, conf, f"votes up={up} dn={dn} ATR={atr14[-1]:.5f}")
-
-# ---------- stats / guardrails / UI ----------
-def _maybe_reset_daily():
-    today = date.today()
-    if STATE["stats"]["last_reset_date"] != today:
-        STATE["stats"].update({"wins":0,"losses":0,"skips":0,"consec_losses":0,"consec_wins":0,"last_reset_date":today})
-
-def _stats_text():
-    _maybe_reset_daily()
-    s = STATE["stats"]; total = s["wins"] + s["losses"]; wr = (s["wins"]/total*100) if total>0 else 0.0
-    return (f"📊 Stats (today)\nWins: {s['wins']} | Losses: {s['losses']} | Skips: {s['skips']}\n"
-            f"Win rate: {wr:.1f}%\nStreaks → Wins: {s['consec_wins']} | Losses: {s['consec_losses']}\n"
-            f"Auto-stop after {STATE['loss_streak_stop']} consecutive losses")
-
-def _record_result(result: str, chat_id=None):
-    _maybe_reset_daily(); s = STATE["stats"]
-    if result == "win":
-        s["wins"] += 1; s["consec_wins"] += 1; s["consec_losses"] = 0
-    elif result == "loss":
-        s["losses"] += 1; s["consec_losses"] += 1; s["consec_wins"] = 0
-        if s["consec_losses"] >= STATE["loss_streak_stop"]:
-            _stop_autopoll(chat_id, reason=f"⛔ Auto-paused: {s['consec_losses']} consecutive losses")
+    need = STATE["require_votes"]
+    if up >= need and up > dn:
+        side, votes = "BUY", up
+    elif dn >= need and dn > up:
+        side, votes = "SELL", dn
     else:
-        s["skips"] += 1
+        return (False, None, 0.0, f"No side (up={up} dn={dn})")
 
-def _signal_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Win", callback_data="sig_win"),
-                                  InlineKeyboardButton("❌ Loss", callback_data="sig_loss"),
-                                  InlineKeyboardButton("⏭️ Skip", callback_data="sig_skip")]])
+    # Confidence derived from votes (strict baseline, cap 95%)
+    conf = max(0.0, min(0.95, 0.70 + 0.05*(votes - 4)))  # 4 votes -> 70%, 5 -> 75%, etc.
+    if conf < STATE["threshold"]:
+        return (False, None, conf, "Low conf")
 
-def _send_signal(chat_id, text, pair):
-    msg = updater.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=_signal_keyboard())
-    STATE["last_signal_message_ids"][pair] = msg.message_id
-    STATE["last_signal_time"] = now_utc(); STATE["last_chat_id"] = chat_id
+    # Payout filter (guest WS or manual)
+    payout = STATE["payouts"].get(symbol)
+    if payout is None and STATE["require_payout_known"]:
+        return (False, None, conf, "Payout unknown")
+    if payout is not None and payout < STATE["min_payout"]:
+        return (False, None, conf, f"Payout {payout}% < {STATE['min_payout']}%")
 
-def on_signal_button(update, ctx: CallbackContext):
+    return (True, side, conf, f"votes={votes} atr={atr14:.5f} payout={payout if payout is not None else 'n/a'}")
+
+# ========= TELEGRAM SIGNALS =========
+def send_signal(bot, chat_id, pair, side, conf):
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Win", callback_data="win"),
+        InlineKeyboardButton("❌ Loss", callback_data="loss"),
+        InlineKeyboardButton("⏭ Skip", callback_data="skip")
+    ]])
+    payout_txt = STATE["payouts"].get(pair)
+    if payout_txt is None:
+        payout_line = f"Min Payout Required: {STATE['min_payout']}% (payout unknown)"
+    else:
+        payout_line = f"Payout: {payout_txt}% (min {STATE['min_payout']}%)"
+
+    txt = (
+        "📊 OTC Signal\n"
+        f"Pair: {pair}\n"
+        f"👉 {side}\n"
+        f"Confidence: {int(conf*100)}%\n"
+        f"{payout_line}"
+    )
+    bot.send_message(chat_id=chat_id, text=txt, reply_markup=keyboard)
+
+# ========= AUTOPOLL LOOP =========
+def autopoll_loop(bot, chat_id):
+    start = datetime.now()
+    end_time = start + timedelta(minutes=STATE["duration_min"])
+    while datetime.now() < end_time and STATE["autopoll_running"]:
+        for pair in STATE["watchlist"]:
+            if not STATE["autopoll_running"]:
+                break
+
+            now = datetime.now()
+            # per-pair cooldown
+            last_pair = STATE["pair_last_signal_time"].get(pair)
+            if last_pair and (now - last_pair).total_seconds() < STATE["cooldown_min"]*60:
+                continue
+            # global min gap between any two signals
+            if STATE["last_signal_time"] and (now - STATE["last_signal_time"]).total_seconds() < STATE["min_signal_gap_min"]*60:
+                continue
+
+            should, side, conf, why = analyze(pair)
+            if should:
+                if STATE["loss_streak"] >= STATE["loss_streak_limit"]:
+                    bot.send_message(chat_id, "🚫 3 losses in a row. Stopping.")
+                    STATE["autopoll_running"] = False
+                    return
+                send_signal(bot, chat_id, pair, side, conf)
+                STATE["pair_last_signal_time"][pair] = now
+                STATE["last_signal_time"] = now
+
+        # exactly one scan per candle close (5min)
+        time.sleep(300)
+
+# ========= INLINE BUTTONS =========
+def on_button(update, ctx):
     q = update.callback_query
-    if not q: return
-    chat_id = q.message.chat_id
-    if q.data == "sig_win":
-        _record_result("win", chat_id); q.answer("Win recorded"); q.edit_message_reply_markup(reply_markup=None); q.message.reply_text("✅ Win noted.\n"+_stats_text())
-    elif q.data == "sig_loss":
-        _record_result("loss", chat_id); q.answer("Loss recorded"); q.edit_message_reply_markup(reply_markup=None); q.message.reply_text("❌ Loss noted.\n"+_stats_text())
-    elif q.data == "sig_skip":
-        _record_result("skip", chat_id); q.answer("Skipped"); q.edit_message_reply_markup(reply_markup=None); q.message.reply_text("⏭️ Skipped.\n"+_stats_text())
+    if not q:
+        return
+    if q.data == "win":
+        STATE["loss_streak"] = 0
+        q.edit_message_text(q.message.text + "\n✅ WIN")
+    elif q.data == "loss":
+        STATE["loss_streak"] += 1
+        q.edit_message_text(q.message.text + "\n❌ LOSS")
+    else:
+        q.edit_message_text(q.message.text + "\n⏭ SKIP")
+    q.answer()
 
-def _stop_autopoll(chat_id=None, reason=""):
-    STATE["autopoll_running"] = False
-    try: STOP_EVENT.set()
-    except: pass
-    if chat_id:
-        try: updater.bot.send_message(chat_id, f"{reason}\nUse /autopoll to start again.")
-        except: pass
-
-# ---------- commands ----------
+# ========= COMMANDS (lean) =========
 def cmd_start(update, ctx):
     update.message.reply_text(
-        "Bot ready ✅ (Render webhook)\n\n"
-        "/watchlist <5 OTC pairs>\n/otc  (strict mode)\n"
-        "/autopoll <amount> <threshold%> <tf> <minutes>\n"
-        "ex: /autopoll 5 78 5min 60\n"
-        "/settings  /stats  /guardrail <N>  /stop"
+        "Bot ready ✅\n"
+        "Use /otc [min_payout] then /autopoll\n"
+        "Example: /otc 80  → only signal if payout ≥ 80%\n"
+        "Default pairs (5 OTC): EURUSD-OTC, GBPUSD-OTC, USDJPY-OTC, AUDUSD-OTC, USDCHF-OTC"
     )
-
-def cmd_help(update, ctx): cmd_start(update, ctx)
-
-def cmd_watchlist(update, ctx):
-    args = " ".join(ctx.args).strip()
-    if args:
-        pairs = [p.strip().upper().replace("/", "") for p in args.split(",") if p.strip()]
-        if len(pairs) != 5: return update.message.reply_text("❌ Please provide exactly 5 OTC pairs (comma-separated).")
-        if not all("-OTC" in p for p in pairs): return update.message.reply_text("❌ OTC focus: include -OTC in all 5 symbols.")
-        STATE["watchlist"] = pairs
-        update.message.reply_text(f"✅ Watchlist set (5): {', '.join(pairs)}")
-    else:
-        update.message.reply_text(f"📌 Current watchlist (5): {', '.join(STATE['watchlist'])}")
-
-def cmd_settings(update, ctx):
-    s=STATE
-    update.message.reply_text(
-        "Settings:\n"
-        f"- timeframe: {s['tf']} (signals at M5 close)\n"
-        f"- threshold: {int(s['threshold']*100)}%\n"
-        f"- confluence votes: {s['require_votes']}\n"
-        f"- ATR floor: {s['atr_floor']}\n"
-        f"- cooldown/pair: {s['cooldown_min']}m | min gap: {s['min_signal_gap_min']}m\n"
-        f"- API budget: {s['max_calls_per_hour']}/hr, {s['daily_call_cap']}/day\n"
-        f"- loss-streak stop: {s['loss_streak_stop']}"
-    )
-
-def cmd_guardrail(update, ctx):
-    try:
-        n = int(ctx.args[0]); n = max(1, min(10, n)); STATE["loss_streak_stop"] = n
-        update.message.reply_text(f"🛡️ Auto-stop after {n} consecutive losses.")
-    except:
-        update.message.reply_text(f"Usage: /guardrail <1-10> (current {STATE['loss_streak_stop']})")
-
-def cmd_stats(update, ctx): update.message.reply_text(_stats_text())
 
 def cmd_otc(update, ctx):
-    STATE["threshold"] = 0.78; STATE["require_votes"] = 4; STATE["atr_floor"] = 0.0005
-    STATE["cooldown_min"] = 5; STATE["min_signal_gap_min"] = 7
-    update.message.reply_text("⚙️ OTC mode: threshold 78%, votes 4/4, ATR 0.0005, cooldown 5m, global gap 7m.")
+    # Optional arg to set payout threshold (e.g. /otc 85)
+    try:
+        if ctx.args:
+            mp = int(ctx.args[0])
+            STATE["min_payout"] = max(50, min(100, mp))
+    except Exception:
+        pass
+    update.message.reply_text(
+        f"⚙️ OTC strict mode ON\n"
+        f"- Confidence ≥ {int(STATE['threshold']*100)}%\n"
+        f"- Confluence: 4/4 (Trend, RSI50, MACD, EMA20/50)\n"
+        f"- ATR floor: {STATE['atr_floor']}\n"
+        f"- Min payout: {STATE['min_payout']}%\n"
+        f"- Cooldown: {STATE['cooldown_min']}m | Gap: {STATE['min_signal_gap_min']}m"
+    )
 
 def cmd_autopoll(update, ctx):
-    if STATE["autopoll_running"]: return update.message.reply_text("ℹ️ Autopoll already running.")
+    if STATE["autopoll_running"]:
+        update.message.reply_text("ℹ️ Already running.")
+        return
+    chat_id = update.effective_chat.id
+    STATE["autopoll_running"] = True
+    STATE["last_signal_time"] = None
+    STATE["pair_last_signal_time"] = {}
+    t = threading.Thread(target=autopoll_loop, args=(ctx.bot, chat_id), daemon=True)
+    STATE["autopoll_thread"] = t
+    t.start()
+    update.message.reply_text("▶️ Autopoll started. Waiting for candle close…")
+
+def cmd_stop(update, ctx):
+    STATE["autopoll_running"] = False
+    update.message.reply_text("⏹️ Autopoll stopped.")
+
+# ========= POCKET OPTION PAYOUT LISTENER (guest) =========
+def start_payout_listener():
     try:
-        amount = float(ctx.args[0]) if len(ctx.args)>0 else STATE["amount"]
-        thr    = float(ctx.args[1])/100.0 if len(ctx.args)>1 else STATE["threshold"]
-        tf     = ctx.args[2] if len(ctx.args)>2 else STATE["tf"]
-        mins   = int(ctx.args[3]) if len(ctx.args)>3 else STATE["duration_min"]
+        import websocket
     except Exception:
-        return update.message.reply_text("Usage: /autopoll <amount> <threshold%> <tf> <minutes>\nex: /autopoll 5 78 5min 60")
+        print("[payout] websocket-client not installed; payouts disabled")
+        return
 
-    STATE["amount"]=amount; STATE["threshold"]=max(0.60,min(0.90,thr)); STATE["tf"]=tf; STATE["duration_min"]=max(10,min(240,mins))
-    STOP_EVENT.clear(); STATE["autopoll_running"]=True; STATE["last_signal_time"]=None; STATE["pair_last_signal_time"]={}; STATE["last_chat_id"]=update.effective_chat.id
+    def _ws_thread():
+        while True:
+            ws = None
+            try:
+                ws = websocket.create_connection(PO_WS_URL, timeout=10)
+                print("[payout] connected to", PO_WS_URL)
 
-    t = threading.Thread(target=autopoll_loop, args=(STATE["last_chat_id"],), daemon=True)
-    STATE["autopoll_thread"]=t; t.start()
-    update.message.reply_text(f"▶️ Autopoll started: ${amount}, threshold {int(STATE['threshold']*100)}%, tf {tf}, duration {STATE['duration_min']}m\nWatchlist: {', '.join(STATE['watchlist'])}")
+                # Some WS servers require a subscription message.
+                # We'll try a few generic messages; harmless if ignored.
+                try:
+                    ws.send(json.dumps({"event": "ping"}))
+                    ws.send(json.dumps({"subscribe": "assets"}))
+                    ws.send(json.dumps({"action": "subscribe", "channel": "assets"}))
+                except Exception:
+                    pass
 
-def cmd_stop(update, ctx): _stop_autopoll(update.effective_chat.id, "⏹️ Stopped.")
+                while True:
+                    msg = ws.recv()
+                    if not msg:
+                        break
 
-# ---------- core loop ----------
-def autopoll_loop(chat_id):
-    try:
-        end = now_utc() + timedelta(minutes=STATE["duration_min"])
-        wait_until_next_m5_close()
-        while now_utc() < end and not STOP_EVENT.is_set():
-            any_signal = False
-            for pair in STATE["watchlist"]:
-                if STOP_EVENT.is_set(): break
-                if not budget_ok(): 
-                    updater.bot.send_message(chat_id, "⏳ API budget reached, pausing until next hour/day window.")
-                    break
-                bars = fetch_ohlcv(pair, "5min", 120)
-                if not bars or len(bars)<60: continue
+                    # Try to parse payouts from various shapes:
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        # Some socket.io payloads embed JSON after a numeric prefix
+                        # e.g., '42["assets", {...}]'
+                        if msg.startswith("42"):
+                            try:
+                                bracket = msg.find("[")
+                                if bracket >= 0:
+                                    data = json.loads(msg[bracket:])
+                                else:
+                                    continue
+                            except Exception:
+                                continue
+                        else:
+                            continue
 
-                should, side, conf, why = evaluate_pair_otc(pair, bars)
+                    # Handle list of assets
+                    if isinstance(data, list):
+                        # e.g., ["assets", [{...}, {...}]]
+                        payloads = []
+                        for item in data:
+                            if isinstance(item, dict):
+                                payloads.append(item)
+                            elif isinstance(item, list):
+                                payloads.extend([x for x in item if isinstance(x, dict)])
+                        if payloads:
+                            _ingest_payout_payloads(payloads)
 
-                # per-pair cooldown
-                nowt = now_utc()
-                lp = STATE["pair_last_signal_time"].get(pair)
-                if lp and (nowt - lp).total_seconds() < STATE["cooldown_min"]*60: should=False
-                # global min gap
-                if should and STATE["last_signal_time"]:
-                    if (nowt - STATE["last_signal_time"]).total_seconds() < STATE["min_signal_gap_min"]*60: should=False
+                    elif isinstance(data, dict):
+                        # direct dict or nested under 'data'/'payload'
+                        if "data" in data and isinstance(data["data"], list):
+                            _ingest_payout_payloads(data["data"])
+                        elif "payload" in data and isinstance(data["payload"], list):
+                            _ingest_payout_payloads(data["payload"])
+                        else:
+                            _ingest_payout_payloads([data])
 
-                if should and conf >= STATE["threshold"]:
-                    msg = (f"📈 *OTC Signal* — {pair}\n"
-                           f"Action: *{side}*\n"
-                           f"Confidence: *{int(conf*100)}%*\n"
-                           f"TF: {STATE['tf']} (entry on M5 close)\n"
-                           f"Amount: ${STATE['amount']}\n"
-                           f"Why: `{why}`")
-                    _send_signal(chat_id, msg, pair)
-                    STATE["pair_last_signal_time"][pair] = nowt
-                    any_signal = True
+            except Exception as e:
+                print("[payout] WS error:", e)
+                time.sleep(10)
+            finally:
+                try:
+                    if ws:
+                        ws.close()
+                except Exception:
+                    pass
 
-            wait_until_next_m5_close()
-    except Exception as e:
-        try: updater.bot.send_message(chat_id, f"❌ Autopoll crashed: {e}")
-        except: pass
-    finally:
-        STATE["autopoll_running"] = False
+    def _ingest_payout_payloads(items):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            sym = item.get("asset") or item.get("symbol") or item.get("pair") or item.get("name")
+            pct = item.get("profit") or item.get("payout") or item.get("rate") or item.get("percent")
+            if sym and pct is not None:
+                try:
+                    pct = int(float(pct))
+                except Exception:
+                    continue
+                sym_norm = str(sym).upper().replace("/", "")
+                # normalize 'EURUSDOTC' -> 'EURUSD-OTC'
+                if "OTC" in sym_norm and not sym_norm.endswith("-OTC"):
+                    sym_norm = sym_norm.replace("OTC", "-OTC")
+                if sym_norm in STATE["watchlist"]:
+                    STATE["payouts"][sym_norm] = pct
 
-# ---------- Telegram boot (webhook) ----------
-updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
-dp = updater.dispatcher
-dp.add_handler(CommandHandler("start",     cmd_start))
-dp.add_handler(CommandHandler("help",      cmd_help))
-dp.add_handler(CommandHandler("watchlist", cmd_watchlist))
-dp.add_handler(CommandHandler("settings",  cmd_settings))
-dp.add_handler(CommandHandler("guardrail", cmd_guardrail))
-dp.add_handler(CommandHandler("stats",     cmd_stats))
-dp.add_handler(CommandHandler("otc",       cmd_otc))
-dp.add_handler(CommandHandler("autopoll",  cmd_autopoll))
-dp.add_handler(CommandHandler("stop",      cmd_stop))
-dp.add_handler(CallbackQueryHandler(on_signal_button))
+    threading.Thread(target=_ws_thread, daemon=True).start()
 
-def on_shutdown(signum, frame):
-    try: _stop_autopoll(STATE.get("last_chat_id"), "🛑 Shutting down.")
-    except: pass
-    try: updater.stop()
-    except: pass
+# ========= BOOT (webhook for Render) =========
+def main():
+    # Start payout listener (guest). If it fails, bot still works with manual /otc threshold.
+    start_payout_listener()
 
-signal.signal(signal.SIGINT, on_shutdown)
-signal.signal(signal.SIGTERM, on_shutdown)
+    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("otc",   cmd_otc))
+    dp.add_handler(CommandHandler("autopoll", cmd_autopoll))
+    dp.add_handler(CommandHandler("stop",  cmd_stop))
+    dp.add_handler(CallbackQueryHandler(on_button))
+
+    updater.start_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=TELEGRAM_BOT_TOKEN,
+        webhook_url=f"{PUBLIC_URL}/{TELEGRAM_BOT_TOKEN}"
+    )
+    updater.idle()
 
 if __name__ == "__main__":
-    path = TELEGRAM_BOT_TOKEN
-    updater.start_webhook(listen="0.0.0.0", port=PORT, url_path=path)
-    webhook_url = f"{PUBLIC_URL}/{path}"
-    updater.bot.set_webhook(webhook_url)
-    print(f"[boot] Webhook set: {webhook_url}")
-    updater.idle()
+    main()
